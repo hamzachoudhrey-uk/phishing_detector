@@ -1,4 +1,4 @@
-# Standalone SMS phishing backend
+# Standalone phishing backend
 
 Run this **on your PC** while your phone (Flutter app) is on the **same Wi‑Fi**.
 
@@ -7,7 +7,8 @@ Run this **on your PC** while your phone (Flutter app) is on the **same Wi‑Fi*
 Copy into `backend/models/`:
 
 - `tfidf_vectorizer.pkl`
-- `email_phishing_model.pkl`
+- `xgb_sms_model (1).pkl` (or your SMS model filename already supported in `main.py`)
+- `url_phishing_model.pkl`
 
 ## 2) Install Python deps (once)
 
@@ -61,6 +62,11 @@ $body = @{ message = "Verify your bank account now" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/check_sms" -ContentType "application/json" -Body $body
 ```
 
+```powershell
+$urlBody = @{ url = "https://example.com/login" } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/check_url" -ContentType "application/json" -Body $urlBody
+```
+
 ## Endpoints
 
 | Method | Path             | Body                 |
@@ -68,3 +74,4 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/check_sms" -ContentTy
 | GET    | `/`              | —                    |
 | POST   | `/check_sms`     | `{"message":"..."}`  |
 | POST   | `/check_message` | same as `/check_sms` |
+| POST   | `/check_url`     | `{"url":"..."}`      |
