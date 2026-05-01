@@ -1,8 +1,11 @@
 """
 Phishing detection API (FastAPI): SMS text + URL analysis.
 
-- POST /check_sms — SMS / short-text path (aggressive URL regex on raw text).
-- POST /check_message — email path: strips HTML, extracts http(s)/www + <a href>, caps URL scans.
+Responses use the TEXT classifier for top-level prediction/result/phishing_probability.
+Optional URL classifier output is attached per link in url_checks only (never flips those top-level flags).
+
+- POST /check_sms — body text processed with URLs stripped; links also classified in url_checks.
+- POST /check_message — HTML stripped for plain text input; anchors + conservative links in url_checks.
 
 Models in backend/models/ (or MODELS_DIR / MODEL_BASE_URL on Railway):
   - tfidf_vectorizer.pkl (or tfidf.pkl)
@@ -104,6 +107,8 @@ class UrlPredictionResponse(PredictionResponse):
 
 
 class CombinedPredictionResponse(PredictionResponse):
+    """Top-level prediction/result/phishing_probability are from the TEXT (SMS/Tfidf) model only."""
+
     text_check: PredictionResponse | None = None
     url_checks: list[UrlPredictionResponse] = Field(default_factory=list)
     extracted_urls: list[str] = Field(default_factory=list)
@@ -440,22 +445,18 @@ def _combined_prediction_response(
     content_mode: str = "sms",
     urls_scan_limit_hit: bool = False,
 ) -> CombinedPredictionResponse:
-    phishing_candidates: list[float] = []
-    any_phishing = False
+    """Build response: top-level fields mirror the TEXT classifier only (matches pre-URL-scan behaviour).
 
+    URL results are informational in url_checks — they no longer flip the top-level phishing flag."""
+    overall_pred = 0
+    overall_prob: float | None = None
     if text_check is not None:
-        any_phishing = any_phishing or text_check.prediction == 1
-        if text_check.phishing_probability is not None:
-            phishing_candidates.append(float(text_check.phishing_probability))
-
-    for check in url_checks:
-        if check.error is None:
-            any_phishing = any_phishing or check.prediction == 1
-            if check.phishing_probability is not None:
-                phishing_candidates.append(float(check.phishing_probability))
-
-    overall_pred = 1 if any_phishing else 0
-    overall_prob = max(phishing_candidates) if phishing_candidates else None
+        overall_pred = int(text_check.prediction)
+        overall_prob = (
+            float(text_check.phishing_probability)
+            if text_check.phishing_probability is not None
+            else None
+        )
 
     return CombinedPredictionResponse(
         prediction=overall_pred,
