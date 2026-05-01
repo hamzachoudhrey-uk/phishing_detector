@@ -1,6 +1,9 @@
 """
 Phishing detection API (FastAPI): SMS text + URL analysis.
 
+- POST /check_sms — SMS / short-text path (aggressive URL regex on raw text).
+- POST /check_message — email path: strips HTML, extracts http(s)/www + <a href>, caps URL scans.
+
 Models in backend/models/ (or MODELS_DIR / MODEL_BASE_URL on Railway):
   - tfidf_vectorizer.pkl (or tfidf.pkl)
   - SMS classifier pickle (e.g. xgb_sms_model (1).pkl)
@@ -66,6 +69,12 @@ ALT_URL_MODEL_PATHS = [
 #   <MODEL_BASE_URL>/sms_rf_model%20(2).pkl   (or one of the ALT names above)
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 
+# Email scans: Gmail bodies are often HTML. Feeding raw HTML/TAG soup to the SMS/Tfidf
+# model yields false phishing flags; scraping URLs with SMS regex pulls hundreds of
+# attribute fragments. Tune via env on Railway if needed.
+MAX_EMAIL_URL_SCANS = int(os.getenv("MAX_EMAIL_URL_SCANS", "40"))
+TEXT_CLASSIFIER_PREVIEW_LEN = int(os.getenv("TEXT_CLASSIFIER_PREVIEW_LEN", "3800"))
+
 
 def _ascii_preview(s: str, limit: int = 600) -> str:
     s = s.replace("\r", " ").replace("\n", " ")
@@ -98,6 +107,12 @@ class CombinedPredictionResponse(PredictionResponse):
     text_check: PredictionResponse | None = None
     url_checks: list[UrlPredictionResponse] = Field(default_factory=list)
     extracted_urls: list[str] = Field(default_factory=list)
+    # Plain-language body (after HTML strip where applicable) passed to SMS/Tfidf model.
+    text_input_preview: str | None = None
+    # "sms" | "plain_email" | "html_email" — clarifies extraction path for clients.
+    content_mode: str = "sms"
+    # True when more URLs were found than scanned (cap at MAX_EMAIL_URL_SCANS).
+    urls_scan_limit_hit: bool = False
 
 
 app = FastAPI(title="Phishing SMS API", version="1.0.0")
@@ -325,10 +340,105 @@ def _prediction_response(pred: int, phishing_proba: float | None) -> PredictionR
     )
 
 
+def _preview_classifier_text(text: str) -> str | None:
+    """Readable preview returned to clients (not truncated for model input)."""
+    if not text:
+        return None
+    t = _normalize_text(text)
+    limit = TEXT_CLASSIFIER_PREVIEW_LEN
+    if len(t) > limit:
+        return t[:limit] + "\n…(truncated in preview)"
+    return t
+
+
+def _looks_like_html(s: str) -> bool:
+    t = s.strip().lower()[:48000]
+    if "<html" in t[:8000]:
+        return True
+    if "<body" in t[:8000]:
+        return True
+    return len(re.findall(r"<[a-zA-Z][a-zA-Z0-9:-]*\b", t)) >= 6
+
+
+def _extract_urls_conservative_plain(text: str) -> list[str]:
+    """Only schemes or www.* — avoids matching user@gmail.com as gmail.com."""
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    patterns = [
+        re.compile(r"(?i)\b(https?://[^\s<>'\"`\]]+)"),
+        re.compile(r"(?i)(?<![@\w])(www\.[^\s<>'\"`\]]+)"),
+    ]
+    for pat in patterns:
+        for match in pat.finditer(text):
+            candidate = _strip_url_trailing_punctuation(match.group(1).strip())
+            if not candidate:
+                continue
+            normalized = _normalize_url(candidate)
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            urls.append(normalized)
+    return urls
+
+
+def _hrefs_from_html(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    seen: set[str] = set()
+    urls: list[str] = []
+    for tag in soup.find_all("a", href=True):
+        raw = tag.get("href")
+        href = unescape(((raw if isinstance(raw, str) else str(raw))) or "").strip()
+        if not href or href.lower().startswith(("javascript:", "mailto:", "tel:", "sms:", "#")):
+            continue
+        if href.startswith("//"):
+            href = "https:" + href
+        if not href.startswith(("http://", "https://")):
+            continue
+        candidate = _strip_url_trailing_punctuation(href)
+        normalized = _normalize_url(candidate)
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(normalized)
+    return urls
+
+
+def _merge_unique_urls(*groups: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for url in group:
+            key = url.lower().rstrip(".")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(url)
+    return out
+
+
+def _plain_with_urls_removed(plain_text: str, urls: list[str]) -> str:
+    rest = plain_text
+    for u in sorted({*urls}, key=len, reverse=True):
+        if len(u) < 6:
+            continue
+        try:
+            rest = re.sub(re.escape(u), " ", rest, flags=re.IGNORECASE)
+        except re.error:
+            rest = rest.replace(u, " ")
+    return _normalize_text(rest)
+
+
 def _combined_prediction_response(
     text_check: PredictionResponse | None,
     url_checks: list[UrlPredictionResponse],
     extracted_urls: list[str],
+    *,
+    text_input_preview: str | None = None,
+    content_mode: str = "sms",
+    urls_scan_limit_hit: bool = False,
 ) -> CombinedPredictionResponse:
     phishing_candidates: list[float] = []
     any_phishing = False
@@ -354,6 +464,9 @@ def _combined_prediction_response(
         text_check=text_check,
         url_checks=url_checks,
         extracted_urls=extracted_urls,
+        text_input_preview=text_input_preview,
+        content_mode=content_mode,
+        urls_scan_limit_hit=urls_scan_limit_hit,
     )
 
 
@@ -674,6 +787,9 @@ def _predict_split_content(raw_message: str) -> CombinedPredictionResponse:
         text_check=text_check,
         url_checks=url_checks,
         extracted_urls=extracted_urls,
+        text_input_preview=_preview_classifier_text(cleaned_text) if cleaned_text else None,
+        content_mode="sms",
+        urls_scan_limit_hit=False,
     )
     print(
         _ascii_preview(
@@ -688,6 +804,77 @@ def _predict_split_content(raw_message: str) -> CombinedPredictionResponse:
     return combined
 
 
+def _predict_email_message(raw_message: str) -> CombinedPredictionResponse:
+    """Strip HTML where present, classify plain text via SMS model, URL model on real links."""
+    raw = raw_message.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="message must not be empty")
+
+    if _looks_like_html(raw):
+        content_mode = "html_email"
+        soup = BeautifulSoup(raw, "html.parser")
+        plain = _normalize_text(soup.get_text(" ", strip=True))
+        anchor_urls = _hrefs_from_html(raw)
+        inline_urls = _extract_urls_conservative_plain(plain)
+        detected_urls = _merge_unique_urls(anchor_urls, inline_urls)
+    else:
+        content_mode = "plain_email"
+        plain = _normalize_text(raw)
+        detected_urls = _merge_unique_urls(_extract_urls_conservative_plain(plain))
+
+    urls_scan_limit_hit = len(detected_urls) > MAX_EMAIL_URL_SCANS
+    urls_to_scan = detected_urls[:MAX_EMAIL_URL_SCANS]
+
+    cleaned_text = _plain_with_urls_removed(plain, detected_urls)
+
+    text_check: PredictionResponse | None = None
+    if cleaned_text:
+        text_check = _predict_sms(cleaned_text)
+
+    url_checks: list[UrlPredictionResponse] = []
+    for url in urls_to_scan:
+        try:
+            url_result = _predict_url(url)
+            url_checks.append(
+                UrlPredictionResponse(
+                    url=url,
+                    prediction=url_result.prediction,
+                    result=url_result.result,
+                    phishing_probability=url_result.phishing_probability,
+                )
+            )
+        except Exception as exc:
+            url_checks.append(
+                UrlPredictionResponse(
+                    url=url,
+                    prediction=0,
+                    result="Unknown",
+                    phishing_probability=None,
+                    error=str(exc),
+                )
+            )
+
+    combined = _combined_prediction_response(
+        text_check=text_check,
+        url_checks=url_checks,
+        extracted_urls=detected_urls,
+        text_input_preview=_preview_classifier_text(cleaned_text) if cleaned_text else None,
+        content_mode=content_mode,
+        urls_scan_limit_hit=urls_scan_limit_hit,
+    )
+    print(
+        _ascii_preview(
+            (
+                f"[email_scan] mode={content_mode} detected_urls={len(detected_urls)} "
+                f"scanned={len(urls_to_scan)} text={'yes' if text_check is not None else 'no'} "
+                f"overall={combined.result}"
+            ),
+            limit=400,
+        )
+    )
+    return combined
+
+
 @app.post("/check_sms", response_model=CombinedPredictionResponse)
 def check_sms(req: SmsRequest) -> CombinedPredictionResponse:
     # Backward compatible: still includes prediction/result/phishing_probability
@@ -697,8 +884,8 @@ def check_sms(req: SmsRequest) -> CombinedPredictionResponse:
 
 @app.post("/check_message", response_model=CombinedPredictionResponse)
 def check_message(req: SmsRequest) -> CombinedPredictionResponse:
-    # Email-body scan path. Same split behavior as SMS.
-    return _predict_split_content(req.message)
+    # Gmail / email bodies — HTML-aware extraction (see `_predict_email_message`).
+    return _predict_email_message(req.message)
 
 
 @app.post("/check_url", response_model=PredictionResponse)
