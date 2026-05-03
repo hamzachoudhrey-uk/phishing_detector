@@ -2,7 +2,8 @@
 Phishing detection API (FastAPI): SMS and email text only (TF-IDF + text classifier).
 
 All user payloads use the same pipeline: visible plain text only (HTML → text), then
-URLs removed; the TF-IDF model never sees HTML tags or URL strings.
+every URL-like token removed (http(s), www, scheme://, bare domains, tel/sms/mailto,
+data: URIs, image/link src in HTML). The model only sees remaining words.
 
 - POST /check_sms — same extraction as /check_message; response `content_mode` is "sms" for plain input.
 - POST /check_message — identical preprocessing; `content_mode` is "plain_email" or "html_email".
@@ -215,17 +216,82 @@ def _strip_url_trailing_punctuation(url: str) -> str:
     return url
 
 
-def _strip_urls_plain_email_style(plain: str) -> str:
-    """Strip http(s)/www URLs conservatively (same rules as plain-text email path).
+def _extract_urls_scheme_any(text: str) -> list[str]:
+    """`ftp://`, `market://`, `https://`, etc."""
+    pat = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>'\"`\]]+")
+    return _urls_from_pattern(text, pat, group=0)
 
-    Used for both `/check_sms` and the non-HTML branch of `/check_message` so the
-    same pasted words yield the same model input. Avoids treating `user@gmail.com`
-    as a bare domain URL (the old SMS-only regex did).
-    """
+
+def _urls_from_pattern(text: str, pat: re.Pattern[str], group: int = 0) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in pat.finditer(text):
+        candidate = _strip_url_trailing_punctuation(match.group(group).strip())
+        if not candidate:
+            continue
+        normalized = _normalize_url(candidate) if "://" in candidate else candidate
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
+def _extract_urls_bare_domain(text: str) -> list[str]:
+    """`evil.com/path` without scheme — skips `user@gmail.com` (after @)."""
+    pat = re.compile(
+        r"(?i)(?<![@\w/.])"
+        r"(?:[a-z](?:[a-z0-9-]*[a-z0-9])?\.)+"
+        r"[a-z]{2,63}"
+        r"(?:/[^\s<>'\"`\]]*)?"
+    )
+    return _urls_from_pattern(text, pat, group=0)
+
+
+def _extract_special_uri_prefixes(text: str) -> list[str]:
+    """Smishing / mailto style."""
+    pat = re.compile(r"(?i)\b(?:mailto|tel|sms):[^\s<>'\"`\]]+")
+    return _urls_from_pattern(text, pat, group=0)
+
+
+def _extract_data_uris(text: str) -> list[str]:
+    pat = re.compile(r"(?i)\bdata:[^\s<>'\"`\]]+")
+    return _urls_from_pattern(text, pat, group=0)
+
+
+def _extract_ipv4_hosts(text: str) -> list[str]:
+    """Literal IPv4 (optional :port / path). Octets 0–255 only so dates like 2024.05.03 are not matched."""
+    octet = r"(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)"
+    pat = re.compile(
+        rf"(?<![\w.])(?:(?:{octet})\.){{3}}{octet}"
+        rf"(?::\d{{1,5}})?(?:/[^\s<>'\"`\]]*)?",
+        re.I,
+    )
+    return _urls_from_pattern(text, pat, group=0)
+
+
+def _collect_urls_to_strip_from_plain(plain: str) -> list[str]:
+    """All URL-like spans to remove before the text model (SMS and non-HTML email)."""
+    n = _normalize_text(plain)
+    if not n:
+        return []
+    return _merge_unique_urls(
+        _extract_urls_conservative_plain(n),
+        _extract_urls_scheme_any(n),
+        _extract_urls_bare_domain(n),
+        _extract_special_uri_prefixes(n),
+        _extract_data_uris(n),
+        _extract_ipv4_hosts(n),
+    )
+
+
+def _strip_urls_plain_email_style(plain: str) -> str:
+    """Strip every URL-like token; same for SMS and plain email."""
     n = _normalize_text(plain)
     if not n:
         return ""
-    detected = _merge_unique_urls(_extract_urls_conservative_plain(n))
+    detected = _collect_urls_to_strip_from_plain(n)
     return _plain_with_urls_removed(n, detected)
 
 
@@ -233,7 +299,7 @@ def _extract_text_for_classifier(raw_message: str) -> tuple[str, bool]:
     """Single preprocessing path for every endpoint: plain visible words only, no URLs.
 
     Returns ``(cleaned_text, used_html_branch)``. The string ``cleaned_text`` is what
-    must be passed to the vectorizer/model (no HTML, no http(s)/www URL tokens).
+    must be passed to the vectorizer/model (no HTML, no URL-like tokens).
     """
     raw = raw_message.strip()
     if not raw:
@@ -241,8 +307,9 @@ def _extract_text_for_classifier(raw_message: str) -> tuple[str, bool]:
     if _looks_like_html(raw):
         plain = _visible_text_from_html(raw)
         anchor_urls = _hrefs_from_html(raw)
-        inline_urls = _extract_urls_conservative_plain(plain)
-        detected_urls = _merge_unique_urls(anchor_urls, inline_urls)
+        src_urls = _http_srcs_from_html(raw)
+        from_plain = _collect_urls_to_strip_from_plain(plain)
+        detected_urls = _merge_unique_urls(anchor_urls, src_urls, from_plain)
         cleaned = _plain_with_urls_removed(plain, detected_urls)
         return (cleaned, True)
     cleaned = _strip_urls_plain_email_style(raw)
@@ -333,6 +400,32 @@ def _hrefs_from_html(html: str) -> list[str]:
     return urls
 
 
+def _http_srcs_from_html(html: str) -> list[str]:
+    """http(s) in img/iframe/etc. ``src`` (visible text often omits these)."""
+    soup = BeautifulSoup(html, "html.parser")
+    seen: set[str] = set()
+    urls: list[str] = []
+    for tag in soup.find_all(src=True):
+        raw = tag.get("src")
+        src = unescape(((raw if isinstance(raw, str) else str(raw))) or "").strip()
+        if not src or src.lower().startswith(("javascript:", "mailto:", "tel:", "sms:", "#")):
+            continue
+        if src.lower().startswith("data:"):
+            continue
+        if src.startswith("//"):
+            src = "https:" + src
+        if not src.startswith(("http://", "https://")):
+            continue
+        candidate = _strip_url_trailing_punctuation(src)
+        normalized = _normalize_url(candidate)
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(normalized)
+    return urls
+
+
 def _merge_unique_urls(*groups: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -349,7 +442,7 @@ def _merge_unique_urls(*groups: list[str]) -> list[str]:
 def _plain_with_urls_removed(plain_text: str, urls: list[str]) -> str:
     rest = plain_text
     for u in sorted({*urls}, key=len, reverse=True):
-        if len(u) < 6:
+        if len(u) < 4:
             continue
         try:
             rest = re.sub(re.escape(u), " ", rest, flags=re.IGNORECASE)
