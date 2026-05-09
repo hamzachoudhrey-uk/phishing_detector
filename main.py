@@ -5,8 +5,13 @@ All user payloads use the same pipeline: visible plain text only (HTML → text)
 every URL-like token removed (http(s), www, scheme://, bare domains, tel/sms/mailto,
 data: URIs, image/link src in HTML). The model only sees remaining words.
 
-- POST /check_sms — same extraction as /check_message; response `content_mode` is "sms" for plain input.
+- POST /check_sms — if the body contains at least one web URL (http(s), www, bare domain, etc.),
+  skips the SMS text classifier and classifies **only the first** such URL with the same
+  ``predict_url_phishing`` logic as ``POST /check_url`` (`sms_used_link_scan_only=true`, one row in
+  `url_checks`, with probabilities). Plain-text SMS uses the text classifier as before.
+  `content_mode` is "sms" for plain input.
 - POST /check_message — identical preprocessing; `content_mode` is "plain_email" or "html_email".
+  (No link-only shortcut — email still uses the text model unless you add it later.)
 
 Models in backend/models/ (or MODELS_DIR / MODEL_BASE_URL on Railway):
   - tfidf_vectorizer.pkl (or tfidf.pkl)
@@ -83,14 +88,25 @@ class PredictionResponse(BaseModel):
     phishing_probability: float | None = None
 
 
+class SmsUrlCheckItem(BaseModel):
+    """Per-URL URL-model row; matches app ``EmailUrlPrediction`` JSON shape."""
+
+    url: str
+    prediction: int = Field(..., description="1 = phishing, 0 = safe (URL model).")
+    result: str
+    phishing_probability: float | None = None
+
+
 class CombinedPredictionResponse(PredictionResponse):
-    """Top-level prediction/result/phishing_probability are from the text (SMS/Tfidf) model only."""
+    """Top-level fields: SMS text model, or first-link URL model when ``sms_used_link_scan_only``."""
 
     text_check: PredictionResponse | None = None
     # Plain-language body (after HTML strip where applicable) passed to SMS/Tfidf model.
     text_input_preview: str | None = None
     # "sms" | "plain_email" | "html_email" — clarifies extraction path for clients.
     content_mode: str = "sms"
+    url_checks: list[SmsUrlCheckItem] = Field(default_factory=list)
+    sms_used_link_scan_only: bool = False
 
 
 class UrlCheckRequest(BaseModel):
@@ -100,9 +116,9 @@ class UrlCheckRequest(BaseModel):
 class UrlCheckItem(BaseModel):
     url: str
     prediction: str
-    probability: float = Field(
-        ...,
-        description="P(phishing): probability score for phishing class ``0``, range 0..1.",
+    probability: float | None = Field(
+        default=None,
+        description="P(phishing), 0..1, when returned by the model.",
     )
 
 
@@ -221,7 +237,7 @@ def _normalize_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme:
         return url
-    return f"http://{url}"
+    return f"https://{url}"
 
 
 def _strip_url_trailing_punctuation(url: str) -> str:
@@ -328,6 +344,87 @@ def _extract_text_for_classifier(raw_message: str) -> tuple[str, bool]:
         return (cleaned, True)
     cleaned = _strip_urls_plain_email_style(raw)
     return (cleaned, False)
+
+
+def _filter_urls_for_web_classifier(urls: list[str]) -> list[str]:
+    """Targets suitable for the URL phishing model: http(s) or schemeless host/path."""
+    out: list[str] = []
+    for u in urls:
+        raw = u.strip()
+        if not raw:
+            continue
+        low = raw.lower()
+        if low.startswith(("mailto:", "tel:", "sms:", "data:", "javascript:")):
+            continue
+        to_parse = raw if "://" in raw else f"https://{raw}"
+        try:
+            parsed = urlparse(to_parse)
+        except Exception:
+            continue
+        sch = (parsed.scheme or "").lower()
+        if sch and sch not in ("http", "https"):
+            continue
+        out.append(raw)
+    return out
+
+
+def _sms_urls_for_link_scan(raw_message: str) -> tuple[list[str], bool]:
+    """HTTP-style URLs in SMS body — if non-empty, SMS uses URL model only (no text classifier)."""
+    raw = raw_message.strip()
+    if not raw:
+        return [], False
+    if _looks_like_html(raw):
+        plain = _visible_text_from_html(raw)
+        detected = _merge_unique_urls(
+            _hrefs_from_html(raw),
+            _http_srcs_from_html(raw),
+            _collect_urls_to_strip_from_plain(plain),
+        )
+        return _filter_urls_for_web_classifier(detected), True
+    detected = _collect_urls_to_strip_from_plain(_normalize_text(raw))
+    return _filter_urls_for_web_classifier(detected), False
+
+
+def _sms_first_url_link_scan(
+    urls: list[str],
+    *,
+    content_mode: str,
+) -> CombinedPredictionResponse | None:
+    """First http(s) URL only — same ``predict_url_phishing`` as ``POST /check_url``."""
+    u = urls[0]
+    try:
+        display, _label, prob, pred_phish = predict_url_phishing(
+            u,
+            model=app.state.url_model,
+            feature_columns=app.state.url_feature_columns,
+        )
+    except Exception as e:
+        print(_ascii_preview(f"[check_sms] first_url URL model failed url={u!r} err={e}", limit=300))
+        return None
+    pred_int = int(pred_phish)
+    item = SmsUrlCheckItem(
+        url=display,
+        prediction=pred_int,
+        result="Phishing" if pred_int == 1 else "Safe",
+        phishing_probability=prob,
+    )
+    print(
+        _ascii_preview(
+            f"[check_sms] first_url url={display!r} overall={item.result}",
+            limit=300,
+        )
+    )
+    link_preview = _preview_classifier_text(f"First URL scanned: {display} → {item.result}")
+    return CombinedPredictionResponse(
+        prediction=pred_int,
+        result=item.result,
+        phishing_probability=prob,
+        text_check=None,
+        text_input_preview=link_preview,
+        content_mode=content_mode,
+        url_checks=[item],
+        sms_used_link_scan_only=True,
+    )
 
 
 def _visible_text_from_html(html: str) -> str:
@@ -564,11 +661,27 @@ def _predict_email_text_only(
 
 @app.post("/check_sms", response_model=CombinedPredictionResponse)
 def check_sms(req: SmsRequest) -> CombinedPredictionResponse:
-    return _predict_email_text_only(
+    urls, is_html = _sms_urls_for_link_scan(req.message)
+    if urls:
+        link_only = _sms_first_url_link_scan(
+            urls,
+            content_mode="html_email" if is_html else "sms",
+        )
+        if link_only is not None:
+            return link_only
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "This message contains a link, but the URL check failed. "
+                "Try again later or use Quick Scan URL."
+            ),
+        )
+    out = _predict_email_text_only(
         req.message,
         plain_content_mode="sms",
         log_tag="check_sms",
     )
+    return out
 
 
 @app.post("/check_message", response_model=CombinedPredictionResponse)
@@ -584,8 +697,7 @@ def check_message_text_only(req: SmsRequest) -> CombinedPredictionResponse:
 
 @app.post("/check_url", response_model=UrlCheckItem)
 def check_url(req: UrlCheckRequest) -> UrlCheckItem:
-    """Same URL handling as ``test_url_model`` (only ``ensure_scheme`` in ``extract_features``). ``probability`` is P(phishing) 0..1."""
-    # Do not use ``_normalize_url`` here — it changes inputs relative to the CLI script.
+    """Same ``predict_url_phishing`` call as SMS first-link scan; includes P(phishing) in JSON."""
     url = req.url.strip()
     display, label, phishing_proba, _pred = predict_url_phishing(
         url,
