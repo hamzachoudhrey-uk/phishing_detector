@@ -1,16 +1,16 @@
 """
-Phishing detection API (FastAPI): SMS/email text (TF-IDF + classifier) and optional URL model.
+Phishing detection API (FastAPI): SMS and email text only (TF-IDF + text classifier).
 
-Text pipeline: visible plain text (HTML → text), URL-like tokens stripped; classifier sees words only.
+All user payloads use the same pipeline: visible plain text only (HTML → text), then
+every URL-like token removed (http(s), www, scheme://, bare domains, tel/sms/mailto,
+data: URIs, image/link src in HTML). The model only sees remaining words.
 
-- POST /check_sms — **SMS text scan only** (same preprocessing as before); URL/XGBoost is **not** applied here.
-- POST /check_message — unchanged email/text pipeline (no URL model).
-- POST /check_quick — Quick-scan path only: text classifier plus URL model on extracted links (merged verdict).
+- POST /check_sms — same extraction as /check_message; response `content_mode` is "sms" for plain input.
+- POST /check_message — identical preprocessing; `content_mode` is "plain_email" or "html_email".
 
 Models in backend/models/ (or MODELS_DIR / MODEL_BASE_URL on Railway):
   - tfidf_vectorizer.pkl (or tfidf.pkl)
   - SMS classifier pickle (e.g. xgb_sms_model (1).pkl)
-  - url_final_xgboost_model.pkl + feature_columns.pkl (URL features → XGBoost)
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 
-from url_phishing_features import build_feature_matrix
+from url_phish import load_url_classifier, predict_url_phishing
 
 # Make terminal printing reliable on Windows.
 try:
@@ -52,9 +52,6 @@ ALT_SMS_MODEL_PATHS = [
     MODELS_DIR / "xgb_sms_model (1).pkl",
 ]
 
-URL_MODEL_PATH = MODELS_DIR / "url_final_xgboost_model.pkl"
-FEATURE_COLUMNS_PATH = MODELS_DIR / "feature_columns.pkl"
-
 # Optional: let Railway download model files at boot.
 # Set MODEL_BASE_URL to something like:
 #   https://raw.githubusercontent.com/<user>/<repo>/main/models
@@ -66,8 +63,6 @@ MODEL_BASE_URL = os.getenv("MODEL_BASE_URL")
 # Gmail/HTML bodies: `_extract_text_for_classifier` turns HTML into visible text and strips
 # URLs before the SMS/Tfidf model runs — same for `/check_sms` when input looks like HTML.
 TEXT_CLASSIFIER_PREVIEW_LEN = int(os.getenv("TEXT_CLASSIFIER_PREVIEW_LEN", "3800"))
-
-URL_FETCH_TIMEOUT_S = float(os.getenv("URL_FETCH_TIMEOUT", "10"))
 
 
 def _ascii_preview(s: str, limit: int = 600) -> str:
@@ -88,24 +83,27 @@ class PredictionResponse(BaseModel):
     phishing_probability: float | None = None
 
 
-class UrlCheckResult(BaseModel):
-    url: str
-    prediction: int
-    result: str
-    phishing_probability: float | None = None
-
-
 class CombinedPredictionResponse(PredictionResponse):
-    """Top-level verdict is from the text model unless SMS link-only mode or /check_quick merge applies."""
+    """Top-level prediction/result/phishing_probability are from the text (SMS/Tfidf) model only."""
 
     text_check: PredictionResponse | None = None
     # Plain-language body (after HTML strip where applicable) passed to SMS/Tfidf model.
     text_input_preview: str | None = None
     # "sms" | "plain_email" | "html_email" — clarifies extraction path for clients.
     content_mode: str = "sms"
-    url_checks: list[UrlCheckResult] = Field(default_factory=list)
-    # True when /check_sms received URLs and skipped the SMS text classifier.
-    sms_used_link_scan_only: bool = False
+
+
+class UrlCheckRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="Raw URL to classify (URL-only XGBoost model)")
+
+
+class UrlCheckItem(BaseModel):
+    url: str
+    prediction: str
+    probability: float = Field(
+        ...,
+        description="P(phishing): probability score for phishing class ``0``, range 0..1.",
+    )
 
 
 app = FastAPI(title="Phishing SMS API", version="1.0.0")
@@ -132,7 +130,6 @@ def _ensure_models_present() -> None:
     has_vec = VECTORIZER_PATH.exists() or any(p.exists() for p in ALT_VECTORIZER_PATHS)
     has_sms = SMS_MODEL_PATH.exists() or any(p.exists() for p in ALT_SMS_MODEL_PATHS)
     if has_vec and has_sms:
-        _maybe_download_url_models()
         return
 
     if not MODEL_BASE_URL:
@@ -144,8 +141,8 @@ def _ensure_models_present() -> None:
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     def _download(name: str, dest: Path) -> None:
-        fetch_url = MODEL_BASE_URL.rstrip("/") + "/" + urllib.parse.quote(name)
-        with urllib.request.urlopen(fetch_url) as resp:  # nosec - controlled by deployment env var
+        url = MODEL_BASE_URL.rstrip("/") + "/" + urllib.parse.quote(name)
+        with urllib.request.urlopen(url) as resp:  # nosec - controlled by deployment env var
             dest.write_bytes(resp.read())
 
     if not VECTORIZER_PATH.exists() and not any(p.exists() for p in ALT_VECTORIZER_PATHS):
@@ -180,33 +177,6 @@ def _ensure_models_present() -> None:
             if last_err is not None:
                 raise last_err
 
-    _maybe_download_url_models()
-
-
-def _maybe_download_url_models() -> None:
-    if not MODEL_BASE_URL:
-        return
-    import urllib.parse
-    import urllib.request
-
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-
-    def _download(name: str, dest: Path) -> None:
-        fetch_url = MODEL_BASE_URL.rstrip("/") + "/" + urllib.parse.quote(name)
-        with urllib.request.urlopen(fetch_url) as resp:  # nosec - controlled by deployment env var
-            dest.write_bytes(resp.read())
-
-    if not URL_MODEL_PATH.exists():
-        try:
-            _download("url_final_xgboost_model.pkl", URL_MODEL_PATH)
-        except Exception:
-            pass
-    if not FEATURE_COLUMNS_PATH.exists():
-        try:
-            _download("feature_columns.pkl", FEATURE_COLUMNS_PATH)
-        except Exception:
-            pass
-
 
 def _resolve_sms_model_path() -> Path:
     if SMS_MODEL_PATH.exists():
@@ -230,18 +200,9 @@ def _startup_load_models() -> None:
     _ensure_models_present()
     app.state.vectorizer = _load_joblib(_resolve_vectorizer_path())
     app.state.sms_model = _load_joblib(_resolve_sms_model_path())
-    app.state.url_model = _load_joblib(URL_MODEL_PATH)
-    raw_cols = joblib.load(FEATURE_COLUMNS_PATH)
-    if isinstance(raw_cols, list):
-        cols = [str(x) for x in raw_cols]
-    elif hasattr(raw_cols, "tolist"):
-        cols = [str(x) for x in raw_cols.tolist()]
-    elif hasattr(raw_cols, "__iter__") and not isinstance(raw_cols, (str, bytes)):
-        cols = [str(x) for x in list(raw_cols)]
-    else:
-        cols = [str(raw_cols)]
-    cols = [c for c in cols if c]
+    cols, url_model = load_url_classifier(MODELS_DIR)
     app.state.url_feature_columns = cols
+    app.state.url_model = url_model
 
 
 @app.get("/")
@@ -367,20 +328,6 @@ def _extract_text_for_classifier(raw_message: str) -> tuple[str, bool]:
         return (cleaned, True)
     cleaned = _strip_urls_plain_email_style(raw)
     return (cleaned, False)
-
-
-def _extract_urls_from_raw(raw_message: str) -> list[str]:
-    """HTTP(S) links and URL-like tokens to pass to the URL phishing model."""
-    raw = raw_message.strip()
-    if not raw:
-        return []
-    if _looks_like_html(raw):
-        plain = _visible_text_from_html(raw)
-        anchor_urls = _hrefs_from_html(raw)
-        src_urls = _http_srcs_from_html(raw)
-        from_plain = _collect_urls_to_strip_from_plain(plain)
-        return _merge_unique_urls(anchor_urls, src_urls, from_plain)
-    return _collect_urls_to_strip_from_plain(_normalize_text(raw))
 
 
 def _visible_text_from_html(html: str) -> str:
@@ -523,18 +470,10 @@ def _combined_prediction_response(
     *,
     text_input_preview: str | None = None,
     content_mode: str = "sms",
-    url_checks: list[UrlCheckResult] | None = None,
-    sms_used_link_scan_only: bool = False,
-    prediction_override: int | None = None,
-    phishing_probability_override: float | None = None,
 ) -> CombinedPredictionResponse:
-    checks = url_checks or []
     overall_pred = 0
     overall_prob: float | None = None
-    if prediction_override is not None:
-        overall_pred = int(prediction_override)
-        overall_prob = phishing_probability_override
-    elif text_check is not None:
+    if text_check is not None:
         overall_pred = int(text_check.prediction)
         overall_prob = (
             float(text_check.phishing_probability)
@@ -549,89 +488,6 @@ def _combined_prediction_response(
         text_check=text_check,
         text_input_preview=text_input_preview,
         content_mode=content_mode,
-        url_checks=checks,
-        sms_used_link_scan_only=sms_used_link_scan_only,
-    )
-
-
-def _aggregate_url_predictions(url_checks: list[UrlCheckResult]) -> tuple[int, float | None]:
-    if not url_checks:
-        return 0, None
-    pred = 1 if any(u.prediction == 1 for u in url_checks) else 0
-    probs = [u.phishing_probability for u in url_checks if u.phishing_probability is not None]
-    prob = max(probs) if probs else None
-    return pred, prob
-
-
-def _predict_urls(urls: list[str]) -> list[UrlCheckResult]:
-    model: Any = app.state.url_model
-    colnames: list[str] = app.state.url_feature_columns
-    out: list[UrlCheckResult] = []
-    for u in urls:
-        try:
-            features = build_feature_matrix(
-                u,
-                colnames,
-                fetch_timeout_s=URL_FETCH_TIMEOUT_S,
-            )
-            pred = int(model.predict(features)[0])
-            phishing_proba: float | None = None
-            if PHISHING_THRESHOLD is not None and hasattr(model, "predict_proba"):
-                proba = model.predict_proba(features)[0]
-                if len(proba) >= 2:
-                    phishing_proba = float(proba[1])
-                    pred = 1 if phishing_proba >= PHISHING_THRESHOLD else 0
-            elif hasattr(model, "predict_proba"):
-                proba = model.predict_proba(features)[0]
-                if len(proba) >= 2:
-                    phishing_proba = float(proba[1])
-            out.append(
-                UrlCheckResult(
-                    url=u,
-                    prediction=pred,
-                    result="Phishing" if pred == 1 else "Safe",
-                    phishing_probability=phishing_proba,
-                )
-            )
-            print(
-                _ascii_preview(
-                    f"[url_model] url={u} pred={pred} proba={phishing_proba}",
-                    limit=280,
-                )
-            )
-        except Exception as ex:
-            print(_ascii_preview(f"[url_model] FAIL url={u} err={ex}", limit=240))
-            out.append(
-                UrlCheckResult(
-                    url=u,
-                    prediction=1,
-                    result="Phishing",
-                    phishing_probability=None,
-                )
-            )
-    return out
-
-
-def _merge_text_and_url_checks(
-    base: CombinedPredictionResponse,
-    url_checks: list[UrlCheckResult],
-) -> CombinedPredictionResponse:
-    """Reuse text fields from ``base``; merge top-level verdict with URL scores."""
-    upred, uprob = _aggregate_url_predictions(url_checks)
-    tpred = int(base.prediction)
-    tprob = base.phishing_probability
-    fpred = 1 if tpred == 1 or upred == 1 else 0
-    probs = [p for p in [tprob, uprob] if p is not None]
-    fprob = max(probs) if probs else None
-    return CombinedPredictionResponse(
-        prediction=fpred,
-        result="Phishing" if fpred == 1 else "Safe",
-        phishing_probability=fprob,
-        text_check=base.text_check,
-        text_input_preview=base.text_input_preview,
-        content_mode=base.content_mode,
-        url_checks=url_checks,
-        sms_used_link_scan_only=False,
     )
 
 
@@ -708,24 +564,11 @@ def _predict_email_text_only(
 
 @app.post("/check_sms", response_model=CombinedPredictionResponse)
 def check_sms(req: SmsRequest) -> CombinedPredictionResponse:
-    """SMS inbox — legacy text-only pipeline (URLs removed before classifier); no URL model."""
     return _predict_email_text_only(
         req.message,
         plain_content_mode="sms",
         log_tag="check_sms",
     )
-
-
-@app.post("/check_quick", response_model=CombinedPredictionResponse)
-def check_quick(req: SmsRequest) -> CombinedPredictionResponse:
-    """Full message text classification plus URL model on extracted links (merged verdict)."""
-    raw = req.message.strip()
-    urls = _extract_urls_from_raw(raw)
-    base = _predict_email_text_only(raw, log_tag="check_quick")
-    if not urls:
-        return base
-    url_checks = _predict_urls(urls)
-    return _merge_text_and_url_checks(base, url_checks)
 
 
 @app.post("/check_message", response_model=CombinedPredictionResponse)
@@ -737,3 +580,16 @@ def check_message(req: SmsRequest) -> CombinedPredictionResponse:
 def check_message_text_only(req: SmsRequest) -> CombinedPredictionResponse:
     """Same as /check_message — one text-only pipeline for the model."""
     return _predict_email_text_only(req.message)
+
+
+@app.post("/check_url", response_model=UrlCheckItem)
+def check_url(req: UrlCheckRequest) -> UrlCheckItem:
+    """Same URL handling as ``test_url_model`` (only ``ensure_scheme`` in ``extract_features``). ``probability`` is P(phishing) 0..1."""
+    # Do not use ``_normalize_url`` here — it changes inputs relative to the CLI script.
+    url = req.url.strip()
+    display, label, phishing_proba, _pred = predict_url_phishing(
+        url,
+        model=app.state.url_model,
+        feature_columns=app.state.url_feature_columns,
+    )
+    return UrlCheckItem(url=display, prediction=label, probability=phishing_proba)
