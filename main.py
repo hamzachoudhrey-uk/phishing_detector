@@ -3,11 +3,9 @@ Phishing detection API (FastAPI): SMS/email text (TF-IDF + classifier) and optio
 
 Text pipeline: visible plain text (HTML → text), URL-like tokens stripped; classifier sees words only.
 
-- POST /check_sms — If the raw message contains extractable links, **only** those URLs are scored with
-  the URL/XGBoost model (SMS text classifier is skipped). If there are no links, behavior matches the
-  legacy SMS text scan.
-- POST /check_message — unchanged email/text pipeline (no URL model yet).
-- POST /check_quick — Text classifier plus URL model on any extracted links (merged verdict).
+- POST /check_sms — **SMS text scan only** (same preprocessing as before); URL/XGBoost is **not** applied here.
+- POST /check_message — unchanged email/text pipeline (no URL model).
+- POST /check_quick — Quick-scan path only: text classifier plus URL model on extracted links (merged verdict).
 
 Models in backend/models/ (or MODELS_DIR / MODEL_BASE_URL on Railway):
   - tfidf_vectorizer.pkl (or tfidf.pkl)
@@ -710,27 +708,7 @@ def _predict_email_text_only(
 
 @app.post("/check_sms", response_model=CombinedPredictionResponse)
 def check_sms(req: SmsRequest) -> CombinedPredictionResponse:
-    raw = req.message.strip()
-    urls = _extract_urls_from_raw(raw)
-    if urls:
-        url_checks = _predict_urls(urls)
-        pred, prob = _aggregate_url_predictions(url_checks)
-        combined = _combined_prediction_response(
-            None,
-            text_input_preview=None,
-            content_mode="sms",
-            url_checks=url_checks,
-            sms_used_link_scan_only=True,
-            prediction_override=pred,
-            phishing_probability_override=prob,
-        )
-        print(
-            _ascii_preview(
-                f"[check_sms] link_scan urls={len(url_checks)} overall={combined.result}",
-                limit=300,
-            )
-        )
-        return combined
+    """SMS inbox — legacy text-only pipeline (URLs removed before classifier); no URL model."""
     return _predict_email_text_only(
         req.message,
         plain_content_mode="sms",
